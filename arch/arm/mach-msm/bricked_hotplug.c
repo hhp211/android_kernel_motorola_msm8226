@@ -11,7 +11,7 @@
  *
  */
 
-#include <linux/powersuspend.h>
+#include <linux/lcd_notify.h>
 #include <linux/init.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
@@ -45,6 +45,7 @@ enum {
 	MSM_MPDEC_UP,
 };
 
+static struct notifier_block notif;
 static struct delayed_work hotplug_work;
 static struct delayed_work suspend_work;
 static struct work_struct resume_work;
@@ -307,24 +308,32 @@ static void __ref bricked_hotplug_resume(struct work_struct *work)
 	}
 }
 
-static void __bricked_hotplug_suspend(struct power_suspend *handler)
-{
-	INIT_DELAYED_WORK(&suspend_work, bricked_hotplug_suspend);
-	queue_delayed_work_on(0, susp_wq, &suspend_work,
-				msecs_to_jiffies(hotplug.suspend_defer_time * 1000));
-}
+static int lcd_notifier_callback(struct notifier_block *this,
+				unsigned long event, void *data) {
 
-static void __bricked_hotplug_resume(struct power_suspend *handler)
-{
-	flush_workqueue(susp_wq);
-	cancel_delayed_work_sync(&suspend_work);
-	queue_work_on(0, susp_wq, &resume_work);
-}
+	if (!hotplug.bricked_enabled)
+		return MSM_MPDEC_DISABLED;
 
-static struct power_suspend bricked_hotplug_power_suspend_driver = {
-	.suspend = __bricked_hotplug_suspend,
-	.resume = __bricked_hotplug_resume,
-};
+	switch (event) {
+	case LCD_EVENT_ON_END:
+	case LCD_EVENT_OFF_START:
+		break;
+	case LCD_EVENT_ON_START:
+		flush_workqueue(susp_wq);
+		cancel_delayed_work_sync(&suspend_work);
+		queue_work_on(0, susp_wq, &resume_work);
+		break;
+	case LCD_EVENT_OFF_END:
+		INIT_DELAYED_WORK(&suspend_work, bricked_hotplug_suspend);
+		queue_delayed_work_on(0, susp_wq, &suspend_work, 
+				 msecs_to_jiffies(hotplug.suspend_defer_time * 1000)); 
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
 
 static int bricked_hotplug_start(void)
 {
@@ -349,10 +358,15 @@ static int bricked_hotplug_start(void)
 		goto err_out;
 	}
 
+	notif.notifier_call = lcd_notifier_callback;
+	if (lcd_register_client(&notif) != 0) {
+		pr_err("%s: Failed to register lcd callback\n", __func__);
+		ret = -EINVAL;
+		goto err_dev;
+	}
+
 	mutex_init(&hotplug.bricked_cpu_mutex);
 	mutex_init(&hotplug.bricked_hotplug_mutex);
-
-	register_power_suspend(&bricked_hotplug_power_suspend_driver);
 
 	INIT_DELAYED_WORK(&hotplug_work, bricked_hotplug_work);
 	INIT_DELAYED_WORK(&suspend_work, bricked_hotplug_suspend);
@@ -363,6 +377,8 @@ static int bricked_hotplug_start(void)
 					msecs_to_jiffies(hotplug.startdelay));
 
 	return ret;
+err_dev:
+	destroy_workqueue(hotplug_wq);
 err_out:
 	hotplug.bricked_enabled = 0;
 	return ret;
@@ -378,10 +394,9 @@ static void bricked_hotplug_stop(void)
 	cancel_delayed_work_sync(&hotplug_work);
 	mutex_destroy(&hotplug.bricked_hotplug_mutex);
 	mutex_destroy(&hotplug.bricked_cpu_mutex);
+	lcd_unregister_client(&notif);
 	destroy_workqueue(susp_wq);
 	destroy_workqueue(hotplug_wq);
-
-	unregister_power_suspend(&bricked_hotplug_power_suspend_driver);
 
 	/* Put all sibling cores to sleep */
 	for_each_online_cpu(cpu) {
